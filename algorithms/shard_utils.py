@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch
 import torch.distributed as dist
+
+
 def get_layer_shards(model: nn.Module, num_shards: int, pattern: str = "sequential"):
     """
     按层将 model.parameters() 划分成 num_shards 份：
@@ -78,8 +80,8 @@ def select_next_shard(shard_tracker, H, K, current_global_step):
 
     torch.distributed.barrier()
     dict_tensor = torch.tensor(
-        [dict.get(i, -1.0) for i in range(K)], 
-        device=device, 
+        [dict.get(i, -1.0) for i in range(K)],
+        device=device,
         dtype=torch.float32
     )
     dist.all_reduce(dict_tensor, op=dist.ReduceOp.SUM)
@@ -91,7 +93,7 @@ def select_next_shard(shard_tracker, H, K, current_global_step):
     # selected_idx = max(shard_tracker, key=lambda idx: shard_tracker[idx]['grad_norm'])
     return selected_idx
 
-#CHANGE 定义函数计算参数数量 
+#CHANGE 定义函数计算参数数量
 def print_shard_param_counts_from_shards(shards, logger):
     """
     shards: List[List[nn.Parameter]]
