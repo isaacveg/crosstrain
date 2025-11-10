@@ -56,7 +56,7 @@ def load_c4_data(dataset_name, tokenizer, batch_size, eval_batch_size, rank, wor
         collate_fn=data_collator,
         batch_size=eval_batch_size,
         pin_memory = True,
-        num_workers = 4
+        # num_workers = 4
     )
 
     # Return train dataloader and None for eval_dataloader, as we'll compute ppl differently

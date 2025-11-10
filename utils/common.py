@@ -87,7 +87,7 @@ def setup_logging(rank, log_dir):
     """
     # 创建目录结构
     os.makedirs(log_dir, exist_ok=True)
-    
+
     logger = logging.getLogger("NodeLogger")
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(f"%(asctime)s - Rank {rank} - %(levelname)s - %(message)s")
@@ -101,12 +101,12 @@ def setup_logging(rank, log_dir):
     fh = logging.FileHandler(log_path)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-    
+
     # 控制台日志
     ch = logging.StreamHandler()
     ch.setFormatter(formatter)
     logger.addHandler(ch)
-    
+
     # 记录运行配置
     if rank == 0:
         config_path = os.path.join(log_dir, "config.txt")
@@ -114,9 +114,9 @@ def setup_logging(rank, log_dir):
             f.write(f"Run dir: {log_dir}\n")
             f.write(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"GPUs: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not specified')}\n")
-    
+
     return logger
-        
+
 def calc_comm_delay(model, world_size, logger, simulated_bandwidth_mbps=None):
     """
     计算模型参数同步的通信时间。
@@ -125,22 +125,22 @@ def calc_comm_delay(model, world_size, logger, simulated_bandwidth_mbps=None):
         return None
     # 计算参数总量（字节）
     total_params_bytes = sum(p.numel() * 4 for p in model.parameters())  # 4 bytes per float32
-    
+
     # 计算理论上的通信量（字节）: 2*(N-1)/N * 参数总量
     comm_volume_bytes = 2 * (world_size - 1) / world_size * total_params_bytes
-    
+
     # 转换为MB
     comm_volume_mb = comm_volume_bytes / (1024 * 1024)
-    
+
     # 模拟的带宽延迟（秒）= 数据量(MB) / 带宽(MB/s)
     simulated_delay = comm_volume_mb / (simulated_bandwidth_mbps / 8)  # 除以8将Mbps转换为MB/s
-    
+
     logger.info(f"模型大小: {total_params_bytes/1024/1024:.2f}MB, Ring All Reduce通信量: {comm_volume_mb:.2f}MB")
     logger.info(f"模拟 {simulated_bandwidth_mbps}Mbps 带宽，延迟 {simulated_delay:.2f}秒")
     return simulated_delay
 
-def evaluate(model, eval_dataloader, device, task_type, 
-             use_amp=True, amp_type=torch.bfloat16, max_eval_batches=None): 
+def evaluate(model, eval_dataloader, device, task_type,
+             use_amp=True, amp_type=torch.bfloat16, eval_batch_size=None, max_eval_batches=None):
     """在验证集上评估模型性能，适配 AMP。
 
     Args:
@@ -164,7 +164,7 @@ def evaluate(model, eval_dataloader, device, task_type,
     try:
         # 尝试获取数据加载器长度
         num_batches = len(eval_dataloader)
-        if max_eval_batches is not None and max_eval_batches < num_batches:
+        if max_eval_batches is not None and max_eval_batches <= num_batches:
             num_batches = max_eval_batches
             print(f"评估将限制在 {max_eval_batches} 个批次。")
     except TypeError:
@@ -182,8 +182,9 @@ def evaluate(model, eval_dataloader, device, task_type,
     # 使用 tqdm 创建进度条
     pbar = tqdm.tqdm(total=num_batches, desc="评估中", unit="batch", leave=False)
 
-    # 禁用梯度计算以节省内存和计算
-    with torch.no_grad():
+    # 使用 inference_mode 进一步降低评估显存占用
+    torch.cuda.empty_cache()
+    with torch.inference_mode():
         batch_count = 0
         for batch in eval_dataloader:
             if batch_count >= num_batches:

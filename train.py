@@ -1,15 +1,17 @@
 import time
+import os
+import argparse
+from typing import Optional
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
 # import wandb  # Add wandb import
-from copy import deepcopy
-from transformers import get_cosine_schedule_with_warmup
-from utils.common import *    # 从 utils/util.py 中导入函数
-from utils.load_data_model import *  # 从 utils/load_data_model.py 中导入函数
+# from copy import deepcopy
+from transformers.optimization import get_cosine_schedule_with_warmup
+from utils.common import init_distributed, setup_logging, evaluate, calc_comm_delay
+from utils.load_data_model import load_data_and_model
 from utils.arg_utils import parse_args
-from utils.checkpointing import save_checkpoint, load_checkpoint, get_latest_checkpoint
-# from utils.shard_utils import *
+from utils.checkpointing import save_checkpoint, load_checkpoint, get_latest_checkpoint, shutdown_async_checkpointing
 from algorithms.diloco import sync_diloco, init_diloco_state
 from algorithms.streaming import sync_streaming_diloco, init_streaming_state
 from algorithms.dc_diloco import sync_dc_diloco, init_dc_state
@@ -17,20 +19,23 @@ from algorithms.shard_utils import select_next_shard
 
 
 # Judge current device type
+global USE_NPU
 try:
     #适配昇腾NPU
     import torch_npu
     from torch_npu.npu.amp import autocast, GradScaler  #适配NPU混合精度训练
     from torch_npu.contrib import transfer_to_npu    #自动迁移
+    USE_NPU = True
     print("使用昇腾NPU进行训练")
 except ImportError:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch import GradScaler
+    USE_NPU = False
     print("使用GPU进行训练")
 
 
 def train(model, dataloader, optimizer, scheduler,
           device, logger, world_size, rank, comm_delay=None,
-          task_type="classification", args=None):
+          task_type="classification", args: Optional[argparse.Namespace] = None):
     """
     训练过程：
     - 模型以 train 模式运行
@@ -144,32 +149,28 @@ def train(model, dataloader, optimizer, scheduler,
             batch = {k: v.to(device) for k, v in batch.items()}
             start_comp = time.time()
 
-            # 如果采用了模拟的训练时间则执行if后面的逻辑
-            if args.simulated_comp_time > 0:
-                # 计算每个微步需要 sleep 的时间
-                simulated_micro_step_time = args.simulated_comp_time / args.gradient_accumulation_steps
-                time.sleep(simulated_micro_step_time)
-                # 创建一个假的 loss，以确保后续代码不会因缺少 loss 变量而出错
-                loss = torch.tensor(0.0)
-            else:
-                # 前向计算、损失计算、反向传播与优化
-                # with autocast(device_type=device.type, enabled=args.use_amp, dtype=args.amp_type):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    if task_type == "language_modeling":
-                        outputs = model(**batch)
-                    elif task_type == "classification":
-                        outputs = model(input_ids=batch["input_ids"],
-                                    attention_mask=batch["attention_mask"],
-                                    labels=batch["label"])
-                    loss = outputs.loss
+            # 前向计算、损失计算、反向传播与优化
+            # with autocast(device_type=device.type, enabled=args.use_amp, dtype=args.amp_type):
+            # NPU 上必须用这个cuda写法不然会报错
+            with torch.autocast(device_type="cuda", dtype=args.amp_type, enabled=args.use_amp):
+                if task_type == "language_modeling":
+                    outputs = model(**batch)
+                elif task_type == "classification":
+                    outputs = model(input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                labels=batch["label"])
+                loss = outputs.loss
 
-                # 缩放损失以适应梯度累积
-                scaled_loss = loss / args.gradient_accumulation_steps
-                scaler.scale(scaled_loss).backward()
+            # 缩放损失以适应梯度累积
+            scaled_loss = loss / args.gradient_accumulation_steps
+            scaler.scale(scaled_loss).backward()
             running_loss += loss.item()
 
             micro_step += 1
             comp_time = time.time() - start_comp
+            if args.simulated_comp_time > 0:
+                # 计算每个微步需要 sleep 的时间
+                comp_time = args.simulated_comp_time
             comp_time_total += comp_time
             log_comp_time += comp_time
             step_comp_time += comp_time
@@ -218,7 +219,8 @@ def train(model, dataloader, optimizer, scheduler,
                 is_best = False
                 if rank==0 and global_step % args.eval_interval == 0 and eval_dataloader is not None:
                     eval_results = evaluate(model, eval_dataloader, device,
-                                            task_type, args.use_amp, args.amp_type)
+                                            task_type, args.use_amp, args.amp_type,
+                                            args.eval_batch_size, args.max_eval_batches)
 
                     # 根据任务类型输出不同的评估指标
                     if task_type == "classification":
@@ -268,8 +270,8 @@ def train(model, dataloader, optimizer, scheduler,
                         comm_time_total += comm_time
                         step_comm_time += comm_time
                         comm_vol_total += total_params_mb
-                elif args.algorithm == 'streaming':
 
+                elif args.algorithm == 'streaming':
                     for shard_idx in range(num_shards):
                         # Check if we need to receive this shard
                         if shard_tracker[shard_idx]["next_receive_step"] == global_step:
@@ -280,14 +282,12 @@ def train(model, dataloader, optimizer, scheduler,
                             comm_time_total += comm_time
                             step_comm_time += comm_time
                             comm_vol_total += shard_tracker[shard_idx]["global_num_bytes"] / (1024 * 1024)  # MB
-
                             # 记录通信时间到 wandb (只在主进程中)
                             if rank == 0 and args.use_wandb:
                                 wandb.log({
                                     "communication_time": comm_time,
                                     "sync_shard_idx": shard_idx,
                                 }, step=global_step)
-
                         # Check if we need to record/send this shard
                         # Send current params in staged_params
                         relative_step = global_step % args.sync_interval
@@ -301,6 +301,7 @@ def train(model, dataloader, optimizer, scheduler,
                                     p.data.clone() for p in shard_tracker[shard_idx]["param_refs"]
                                 ]
                             logger.info(f"分片 {shard_idx+1} 已记录并发送，当前步数: {global_step}, 将在步数 {shard_tracker[shard_idx]['next_receive_step']} 接收")
+
                 elif args.algorithm == 'dc':
                     for shard_idx in range(num_shards):
                         # Check if we need to receive this shard
@@ -368,7 +369,8 @@ def train(model, dataloader, optimizer, scheduler,
                 # 进行最终评估
                 final_metrics = {}
                 final_eval_results = evaluate(model, eval_dataloader, device,
-                                             task_type, args.use_amp, args.amp_type)
+                                             task_type, args.use_amp, args.amp_type,
+                                             args.eval_batch_size, args.max_eval_batches)
                 for k, v in final_eval_results.items():
                     final_metrics[f"final/eval_{k}"] = v
 
@@ -559,6 +561,7 @@ def main():
                 wandb.finish()
 
         logger.info("Destroying process group...")
+        shutdown_async_checkpointing(logger)
         dist.destroy_process_group()
         logger.info("Process group destroyed.")
 
