@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 
 def parse_args():
     parser = ArgumentParser(description='分布式训练 BERT 模型')
-    parser.add_argument('--log_dir', type=str, default=None, 
+    parser.add_argument('--log_dir', type=str, default=None,
                         help='日志目录')
     # 添加训练相关参数
     parser.add_argument('--model_name', type=str, default='llama150m',
@@ -47,6 +47,8 @@ def parse_args():
                         help='验证集评估的间隔步数')
     parser.add_argument('--eval_batch_size', type=int, default=32,
                         help='验证时的批处理大小')
+    parser.add_argument('--max_eval_batches', type=int, default=50,
+                        help='每次评估的最大批次数')
     # 添加 wandb 相关参数
     parser.add_argument('--wandb_project', type=str, default='distrain',
                     help='Weights & Biases 项目名称')
@@ -65,15 +67,15 @@ def parse_args():
                         help='保存检查点的间隔步数')
     parser.add_argument('--max_checkpoints', type=int, default=2,
                         help='最多保存的检查点数量')
-    
+
     # Streaming DiLoCo 特有参数
-    parser.add_argument('--num_shards', type=int, default=5, 
+    parser.add_argument('--num_shards', type=int, default=5,
                         help='模型参数分块数量')
     parser.add_argument("--pattern", choices=["sequential","stride"], default="stride",
                     help="layer 划分方式")
-    parser.add_argument('--delay_steps', type=int, default=5, 
+    parser.add_argument('--delay_steps', type=int, default=5,
                         help='通信延迟的步数')
-    parser.add_argument('--alpha', type=float, default=0.5, 
+    parser.add_argument('--alpha', type=float, default=0.5,
                         help='本地模型与全局更新模型的混合比例')
     parser.add_argument('--offset', type=int, default=0,
                         help='分片发送时间点的偏移量')
