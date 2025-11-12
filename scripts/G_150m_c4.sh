@@ -36,12 +36,12 @@ run_experiment() {
 # DiLoCo H=50
 # model name直接传地址
 run_experiment --dataset_name "$C4EN_PATH" --model_name "$LLAMA150M_PATH" \
-    --sync_interval 1 --use_nesterov \
-    --eval_interval 1 --eval_batch_size 4 --max_eval_batches 400\
-    --use_amp --amp_type 'bf16' --total_steps 10 \
-    --checkpoint_interval 3 --checkpoint_dir 'ckpts/sdiloco_150m' \
-    --max_checkpoints 2 \
-    --delay_steps 1 \
+    --sync_interval 100 --use_nesterov \
+    --eval_interval 100 --eval_batch_size 4 --max_eval_batches 400\
+    --use_amp --amp_type 'bf16' --total_steps 44000 \
+    --checkpoint_interval 500 --checkpoint_dir 'ckpts/sdiloco_150m' \
+    --max_checkpoints 3 \
+    --delay_steps 5 \
     --num_shards 4 \
     --N 8 \
     --algorithm "streaming" \

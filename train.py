@@ -365,7 +365,7 @@ def train(model, dataloader, optimizer, scheduler,
 
 
         if global_step >= args.total_steps:
-            if eval_dataloader is not None:
+            if eval_dataloader is not None and rank == 0:
                 # 进行最终评估
                 final_metrics = {}
                 final_eval_results = evaluate(model, eval_dataloader, device,
