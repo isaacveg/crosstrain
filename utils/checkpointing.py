@@ -6,6 +6,7 @@ import queue
 from typing import Dict, Any, Optional
 
 import torch
+from torch.cuda import device_memory_used
 import torch.distributed as dist
 
 """
@@ -290,10 +291,6 @@ def _write_checkpoint_payload(checkpoint: Dict[str, Any],
 
     # Best model handling (only rank0 needs its own copy; other ranks optional)
     if is_best and rank == 0:
-        best_dir = os.path.join(checkpoint_dir, "best_model")
-        os.makedirs(best_dir, exist_ok=True)
-        best_path = os.path.join(best_dir, f"rank_0.pt")
-        shutil.copy2(file_path, best_path)
         meta_path = os.path.join(checkpoint_dir, "best_step.txt")
         with open(meta_path, "w") as f:
             f.write(f"step: {global_step}\nmetric: {metric_value if metric_value is not None else 'N/A'}\n")
@@ -436,11 +433,11 @@ def load_checkpoint(
     if rng_states:
         torch_state = rng_states.get("torch")
         if torch_state is not None:
-            torch.set_rng_state(torch.tensor(torch_state, dtype=torch.uint8))
+            torch.set_rng_state(torch.tensor(torch_state, dtype=torch.uint8, device='cpu'))
         if torch.cuda.is_available():
             cuda_states = rng_states.get("cuda")
             if cuda_states is not None:
-                cuda_list = [torch.tensor(s, dtype=torch.uint8) for s in cuda_states]
+                cuda_list = [torch.tensor(s, dtype=torch.uint8, device='cpu') for s in cuda_states]
                 torch.cuda.set_rng_state_all(cuda_list)
 
     # Algorithm-specific

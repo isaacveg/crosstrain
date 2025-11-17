@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from torch.optim import SGD
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from .shard_utils import (
     get_layer_shards,
@@ -31,6 +32,9 @@ def init_streaming_state(
         )
 
     num_shards = args.num_shards
+    offload_to_cpu = getattr(args, "outer_opt_on_cpu", getattr(args, "outer_opt_cpu", False))
+    if not hasattr(args, "outer_opt_cpu"):
+        setattr(args, "outer_opt_cpu", offload_to_cpu)
     shard_params, num_layers = get_layer_shards(model, num_shards, args.pattern)
 
     # Each shard syncs inside one sync_interval at a fixed relative offset
@@ -50,9 +54,10 @@ def init_streaming_state(
 
     shard_tracker: Dict[int, Dict[str, Any]] = {}
     for shard_idx, param_list in enumerate(shard_params):
+        params_init = [p.detach().to("cpu", copy=True) if offload_to_cpu else p.data.clone() for p in param_list]
         shard_tracker[shard_idx] = {
             # A working copy used as the 'global' reference for outer updates
-            "params": [p.data.clone() for p in param_list],
+            "params": params_init,
             # Snapshot of local params at send time; will be set during runtime
             "staged_params": None,
             "sent_at_step": 0,
@@ -108,41 +113,38 @@ def sync_streaming_diloco(
 
     # --- 1. Calculate Outer Gradient Delta: Δm,p = θ(t_rec - H)_m,p - θ(t_rec)_m,p ---
     with torch.no_grad():
-        sync_grads = [
-            p_old.data - p_rec.data
-            for p_old, p_rec in zip(cur_shard["params"], cur_shard["staged_params"])
-        ]
+        offload_cpu = cur_shard["params"][0].device.type == "cpu"
+        sync_grads = []
+        for p_old, p_rec in zip(cur_shard["params"], cur_shard["staged_params"]):
+            if offload_cpu and p_rec.device.type != "cpu":
+                p_rec_cpu = p_rec.detach().to("cpu", copy=True)
+            else:
+                p_rec_cpu = p_rec
+            g = p_old.data.clone()
+            g.sub_(p_rec_cpu.data if hasattr(p_rec_cpu, "data") else p_rec_cpu)
+            sync_grads.append(g)
 
     # --- 2. Communicate and Average Delta: Δp = (1/M) * Σ Δm,p ---
     comm_start = time.time()
-    # Batch communication - flatten gradients for this shard
-    try:
-        flat_grads = torch.cat([g.flatten() for g in sync_grads])
-    except RuntimeError as e:
-        logger.error(f"Error flattening gradients for shard {sync_shard_idx}: {e}")
-        for i, g in enumerate(sync_grads):
-            logger.error(
-                f"  Grad {i} shape: {g.shape}, dtype: {g.dtype}, device: {g.device}"
-            )
-        return 0.0  # Skip if flattening fails
-
-    dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
-    flat_grads.div_(world_size)  # flat_grads now holds averaged Δp
-
-    # Unflatten the averaged delta back into sync_grads list structure
-    # sync_grads will now hold the averaged Δp, structured like the parameters
-    offset = 0
-    for grad in sync_grads:
-        numel = grad.numel()
-        if offset + numel > flat_grads.numel():
-            logger.error(
-                f"Error unflattening: offset {offset} + numel {numel} > flat_grads size {flat_grads.numel()}"
-            )
-            return 0.0  # Skip if unflattening calculation is wrong
-        grad.copy_(flat_grads[offset : offset + numel].view_as(grad))
-        offset += numel
+    device = next(model.parameters()).device
+    if cur_shard["params"][0].device.type == "cpu":
+        flat_cpu = _flatten_dense_tensors([g.detach() for g in sync_grads])
+        flat_gpu = flat_cpu.to(device, non_blocking=True)
+        dist.all_reduce(flat_gpu, op=dist.ReduceOp.SUM)
+        flat_gpu.div_(world_size)
+        averaged = _unflatten_dense_tensors(flat_gpu.cpu(), sync_grads)
+        for dst, src in zip(sync_grads, averaged):
+            dst.copy_(src)
+        del flat_cpu, flat_gpu, averaged
+    else:
+        flat_gpu = _flatten_dense_tensors([g.detach() for g in sync_grads])
+        dist.all_reduce(flat_gpu, op=dist.ReduceOp.SUM)
+        flat_gpu.div_(world_size)
+        averaged = _unflatten_dense_tensors(flat_gpu, sync_grads)
+        for dst, src in zip(sync_grads, averaged):
+            dst.copy_(src)
+        del flat_gpu, averaged
     comm_time = time.time() - comm_start
-    del flat_grads  # Free memory
 
     # --- 3. Apply Outer Optimization: θ_outer = OuterOpt(θ(t_rec - H)_p, Δp) ---
     if cur_shard["outer_optimizer"]:
@@ -166,7 +168,7 @@ def sync_streaming_diloco(
     param_refs = cur_shard["param_refs"]
     with torch.no_grad():
         for local_p, updated_p in zip(param_refs, globally_updated):
-            local_p.data.mul_(alpha).add_(updated_p.data, alpha=1 - alpha)
+            local_p.data.mul_(alpha).add_(updated_p.data.to(local_p, alpha=1 - alpha))
 
     # --- 5. Prepare State for Next Cycle ---
     with torch.no_grad():

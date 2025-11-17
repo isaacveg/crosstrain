@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from .streaming import init_streaming_state
 
 
 def init_dc_state(model: torch.nn.Module, args: Any, logger: Any) -> Dict[str, Any]:
@@ -91,48 +93,46 @@ def sync_dc_diloco(
 
     # --- 1. 计算外层梯度近似增量 Δm,p = θ(t_rec - H)_m,p - θ(t_rec)_m,p ---
     with torch.no_grad():
-        sync_grads = [
-            p_old.data - p_rec.data
-            for p_old, p_rec in zip(cur_shard["params"], cur_shard["staged_params"])
-        ]
+        offload_cpu = cur_shard["params"][0].device.type == "cpu"
+        sync_grads = []
+        for p_old, p_rec in zip(cur_shard["params"], cur_shard["staged_params"]):
+            if offload_cpu and p_rec.device.type != "cpu":
+                p_rec_cpu = p_rec.detach().to("cpu", copy=True)
+            else:
+                p_rec_cpu = p_rec
+            g = (p_old.data if hasattr(p_old, "data") else p_old).clone()
+            g.sub_(p_rec_cpu.data if hasattr(p_rec_cpu, "data") else p_rec_cpu)
+            sync_grads.append(g)
 
     # --- 2. 通信聚合 Δp = (1/M) * Σ Δm,p ---
     comm_start = time.time()
-    try:
-        flat_grads = torch.cat([g.flatten() for g in sync_grads])
-    except RuntimeError as e:
-        logger.error(f"Error flattening gradients for shard {sync_shard_idx}: {e}")
-        for i, g in enumerate(sync_grads):
-            logger.error(
-                f"  Grad {i} shape: {g.shape}, dtype: {g.dtype}, device: {g.device}"
-            )
-        return 0.0
-
-    dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
-    flat_grads.div_(world_size)
-
-    # Unflatten
-    offset = 0
-    for grad in sync_grads:
-        numel = grad.numel()
-        if offset + numel > flat_grads.numel():
-            logger.error(
-                f"Error unflattening: offset {offset} + numel {numel} > flat_grads size {flat_grads.numel()}"
-            )
-            return 0.0
-        grad.copy_(flat_grads[offset : offset + numel].view_as(grad))
-        offset += numel
+    device = next(model.parameters()).device
+    if cur_shard["params"][0].device.type == "cpu":
+        flat_cpu = _flatten_dense_tensors([g.detach() for g in sync_grads])
+        flat_gpu = flat_cpu.to(device, non_blocking=True)
+        dist.all_reduce(flat_gpu, op=dist.ReduceOp.SUM)
+        flat_gpu.div_(world_size)
+        averaged = _unflatten_dense_tensors(flat_gpu.cpu(), sync_grads)
+        for dst, src in zip(sync_grads, averaged):
+            dst.copy_(src)
+        del flat_cpu, flat_gpu, averaged
+    else:
+        flat_gpu = _flatten_dense_tensors([g.detach() for g in sync_grads])
+        dist.all_reduce(flat_gpu, op=dist.ReduceOp.SUM)
+        flat_gpu.div_(world_size)
+        averaged = _unflatten_dense_tensors(flat_gpu, sync_grads)
+        for dst, src in zip(sync_grads, averaged):
+            dst.copy_(src)
+        del flat_gpu, averaged
     comm_time = time.time() - comm_start
-    del flat_grads  # 释放内存
 
     # --- 3. 外层优化或简单平均 (SGD outer step / averaging) ---
     if cur_shard["outer_optimizer"]:
         cur_shard["outer_optimizer"].zero_grad()
         for param, avg_delta in zip(cur_shard["params"], sync_grads):
-            if param.grad is None:
-                param.grad = avg_delta.clone()
-            else:
-                param.grad.copy_(avg_delta)
+            if param.grad is None or (hasattr(param, "grad") and param.grad is not None and param.grad.shape != param.data.shape):
+                param.grad = torch.zeros_like(param.data)
+            param.grad.copy_(avg_delta)
         cur_shard["outer_optimizer"].step()
     else:
         with torch.no_grad():
@@ -146,15 +146,18 @@ def sync_dc_diloco(
     # --- 4. 构造局部更新估计 g_1 与偏差 D ---
     # g_1: (staged_params - local_params) （原注释里曾尝试除以 delay_steps）
     current_local_params = param_refs
-    g_1 = [
-        staged_p.data - local_p.data
-        for local_p, staged_p in zip(current_local_params, cur_shard["staged_params"])
-    ]
-    # D: (global_params - staged_params) （本地快照与全局之间的偏差）
-    D = [
-        global_p.data - local_p.data
-        for global_p, local_p in zip(cur_shard["params"], cur_shard["staged_params"])
-    ]
+    offload_cpu = cur_shard["params"][0].device.type == "cpu"
+    if offload_cpu:
+        local_list = [p.detach().to("cpu", copy=True) for p in current_local_params]
+        staged_list = [p.detach().to("cpu", copy=True) for p in cur_shard["staged_params"]]
+        global_list = cur_shard["params"]
+    else:
+        local_list = [p.data for p in current_local_params]
+        staged_list = [p.data for p in cur_shard["staged_params"]]
+        global_list = [p.data for p in cur_shard["params"]]
+    g_1 = [s.clone().sub_(l) for s, l in zip(staged_list, local_list)]
+    # D: (global_params - staged_params)
+    D = [g.clone().sub_(s) for g, s in zip(global_list, staged_list)]
 
     # --- 5. 动态延迟补偿 (Hadamard 修正) ---
     g_1_corrected = []
@@ -183,7 +186,8 @@ def sync_dc_diloco(
         for global_p, g_corr, local_p in zip(
             cur_shard["params"], g_1_corrected, param_refs
         ):
-            local_p.data.copy_(global_p.data - g_corr)
+            gp = global_p.data if hasattr(global_p, "data") else global_p
+            local_p.data.copy_((gp - g_corr.to(gp.device) if hasattr(g_corr, "to") else gp - g_corr).to(local_p.device))
 
     # --- 7. 准备下一轮状态 ---
     with torch.no_grad():

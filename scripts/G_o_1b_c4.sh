@@ -20,7 +20,8 @@ LLAMA150M_PATH='PrimeIntellect/llama-150m-fresh'
 # LLAMA150M_PATH='/home/xuxinchen/crosstrain/models/llama-150m-fresh'
 
 # dataset quick reference
-C4EN_PATH='allenai/c4'
+# C4EN_PATH='allenai/c4'
+C4EN_PATH='/data/hfhub/datasets/c4'
 SST2_PATH='glue/sst2'
 
 run_experiment() {
@@ -44,8 +45,8 @@ run_experiment --dataset_name "$C4EN_PATH" --model_name "$LLAMA1B_PATH" \
     --delay_steps 5 \
     --num_shards 8 \
     --N 12 \
-    --algorithm "streaming" \
-    --batch_size 16 \
+    --algorithm "dc" \
+    --batch_size 8 \
     --effective_batch_size 256 --resume
     # \
     # --resume

@@ -1,3 +1,4 @@
+import os
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from datasets import load_dataset
@@ -34,11 +35,23 @@ def load_sst2_data(tokenizer, batch_size, eval_batch_size, rank, world_size):
 def load_c4_data(dataset_name, tokenizer, batch_size, eval_batch_size, rank, world_size):
     """Load C4-en dataset for language modeling"""
     # Load only training data, no validation set
-    ds = load_dataset(f"{dataset_name}", streaming=True,
-                      data_files={
-                "train": "en/c4-train.*.json.gz",
-                "validation": "en/c4-validation.00000-of-00008.json.gz",
-            })
+    if os.path.isdir(dataset_name) or os.path.isfile(dataset_name):
+        # Local C4 root directory, e.g. /data/hfhub/datasets/c4
+        root = dataset_name
+        train_glob = os.path.join(root, "en", "c4-train.*.json.gz")
+        val_glob = os.path.join(root, "en", "c4-validation.00000-of-00008.json.gz")
+        ds = load_dataset(
+            "json",
+            data_files={"train": train_glob, "validation": val_glob},
+            streaming=True,
+        )
+    else:
+        # Hub dataset path (will require network unless fully cached)
+        ds = load_dataset(f"{dataset_name}", streaming=True,
+                          data_files={
+                    "train": "en/c4-train.*.json.gz",
+                    "validation": "en/c4-validation.00000-of-00008.json.gz",
+                })
     ds = ds.shuffle(seed=2025)
 
     block_size = 1024   # DiLoCo 论文
