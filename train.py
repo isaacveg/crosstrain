@@ -102,9 +102,10 @@ def train(model, dataloader, optimizer, scheduler,
         if resume_path:
             logger.info(f"Rank {rank}: 正在从检查点恢复训练: {resume_path}")
             # 加载检查点状态
+            map_location = "cpu" if getattr(args, "outer_opt_cpu", False) else device
             training_state = load_checkpoint(
                 resume_path, model, optimizer, scheduler, scaler,
-                original_snapshot, outer_optimizer, shard_tracker, rank, device, False, logger
+                original_snapshot, outer_optimizer, shard_tracker, rank, map_location, False, logger
             )
             # 检查加载的算法是否与当前配置匹配
             loaded_algorithm = training_state.get("algorithm")
@@ -265,7 +266,8 @@ def train(model, dataloader, optimizer, scheduler,
                     if global_step % args.sync_interval == 0:
                         comm_time = sync_diloco(
                             model, original_snapshot, outer_optimizer,
-                            world_size, logger, comm_delay
+                            world_size, logger, comm_delay,
+                            getattr(args, "outer_opt_cpu", False)
                         )
                         comm_time_total += comm_time
                         step_comm_time += comm_time
@@ -297,7 +299,13 @@ def train(model, dataloader, optimizer, scheduler,
                             shard_tracker[shard_idx]["next_receive_step"] = global_step + args.delay_steps
 
                             # 使用clone()创建参数的深拷贝而不仅是引用
-                            shard_tracker[shard_idx]["staged_params"] = [
+                            offload_cpu = args.outer_opt_cpu
+                            if offload_cpu:
+                                shard_tracker[shard_idx]["staged_params"] = [
+                                    p.detach().to("cpu", copy=True) for p in shard_tracker[shard_idx]["param_refs"]
+                                ]
+                            else:
+                                shard_tracker[shard_idx]["staged_params"] = [
                                     p.data.clone() for p in shard_tracker[shard_idx]["param_refs"]
                                 ]
                             logger.info(f"分片 {shard_idx+1} 已记录并发送，当前步数: {global_step}, 将在步数 {shard_tracker[shard_idx]['next_receive_step']} 接收")
@@ -327,7 +335,11 @@ def train(model, dataloader, optimizer, scheduler,
                         if selected_shard_idx is not None:
                             shard_tracker[selected_shard_idx]["old_sent_at_step"] = shard_tracker[selected_shard_idx]["sent_at_step"]
                             shard_tracker[selected_shard_idx]["sent_at_step"] = global_step
-                            shard_tracker[selected_shard_idx]["staged_params"] = [p.data.clone() for p in shard_tracker[selected_shard_idx]["param_refs"]]
+                            offload_cpu = getattr(args, "outer_opt_cpu", getattr(args, "outer_opt_on_cpu", False))
+                            if offload_cpu:
+                                shard_tracker[selected_shard_idx]["staged_params"] = [p.detach().to("cpu", copy=True) for p in shard_tracker[selected_shard_idx]["param_refs"]]
+                            else:
+                                shard_tracker[selected_shard_idx]["staged_params"] = [p.data.clone() for p in shard_tracker[selected_shard_idx]["param_refs"]]
                             shard_tracker[selected_shard_idx]["next_receive_step"] = global_step + args.delay_steps
                             logger.info(f"分片 {selected_shard_idx+1} 已记录并发送，当前步数: {global_step}, 将在步数 {shard_tracker[selected_shard_idx]['next_receive_step']} 接收")
                 if rank == 0:
@@ -365,7 +377,7 @@ def train(model, dataloader, optimizer, scheduler,
 
 
         if global_step >= args.total_steps:
-            if eval_dataloader is not None:
+            if eval_dataloader is not None and rank == 0:
                 # 进行最终评估
                 final_metrics = {}
                 final_eval_results = evaluate(model, eval_dataloader, device,

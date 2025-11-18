@@ -34,6 +34,10 @@ def parse_args():
                     help='模拟的网络带宽 (Mbps)，不设置则使用实际带宽')
     parser.add_argument('--log_interval', type=int, default=50,
                     help='日志输出的间隔步数')
+    # 节省显存用参数
+    parser.add_argument('--outer_opt_cpu', action='store_true',
+                        help='是否在 CPU 上外层优化以节省显存')
+
     # Warm Up
     parser.add_argument('--warmup_steps', type=int, default=1000,
                     help='热身学习率')

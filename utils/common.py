@@ -260,6 +260,6 @@ def evaluate(model, eval_dataloader, device, task_type,
             log_message += "无有效样本处理。"
 
     print(log_message) # 打印最终评估结果
-
+    torch.cuda.empty_cache()
     model.train() # 恢复模型到训练模式
     return results

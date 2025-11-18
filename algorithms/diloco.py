@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.optim import SGD
 
 
@@ -21,9 +22,14 @@ def init_diloco_state(
     """
     if logger:
         logger.info("Initializing state for 'DiLoCo' algorithm.")
-
-    original_snapshot = deepcopy(model)
+    offload_to_cpu = getattr(args, "outer_opt_on_cpu", getattr(args, "outer_opt_cpu", False))
+    if not hasattr(args, "outer_opt_cpu"):
+        setattr(args, "outer_opt_cpu", offload_to_cpu)
+    target_device = torch.device("cpu") if offload_to_cpu else next(model.parameters()).device
+    original_snapshot = deepcopy(model).to(target_device)
     if args.outer_lr != 1.0:
+        for param in original_snapshot.parameters():
+            param.requires_grad_(True)
         outer_optimizer = SGD(
             original_snapshot.parameters(),
             lr=args.outer_lr,
@@ -40,7 +46,7 @@ def init_diloco_state(
 
 
 def sync_diloco(
-    model, original_model, outer_optimizer, world_size, logger, comm_delay=None
+    model, original_model, outer_optimizer, world_size, logger, comm_delay=None, offload_cpu=None
 ):
     """
     Synchronizes model parameters across distributed processes.
@@ -66,59 +72,56 @@ def sync_diloco(
     """
     print("--------------------diloco is executing-------------------------")
     sync_comm_time = 0.0
+    if offload_cpu is None:
+        prototype_param = next(original_model.parameters(), None)
+        offload_cpu = prototype_param is not None and prototype_param.device.type == "cpu"
     with torch.no_grad():
         if outer_optimizer:
-            # --- DiLoCo-like Synchronization ---
             grads_for_sync = []
             # Calculate the effective gradient (update direction) for the outer step
             for param, original_param in zip(
                 model.parameters(), original_model.parameters()
             ):
-                grad_update = original_param.data - param.data
-                # Assign this difference to the .grad field of the parameters
-                # in original_model so the outer_optimizer can use it.
-                if original_param.grad is None:
+                if original_param.grad is None or original_param.grad.shape != original_param.data.shape:
                     original_param.grad = torch.zeros_like(original_param.data)
-                original_param.grad.copy_(grad_update)
-                grads_for_sync.append(
-                    original_param.grad.data
-                )  # Collect grads for all-reduce
+                # In-place: grad = original - current
+                original_param.grad.copy_(original_param.data)
+                if offload_cpu:
+                    p_cpu = param.detach().to("cpu", copy=True)
+                    original_param.grad.sub_(p_cpu)
+                else:
+                    original_param.grad.sub_(param.data)
+                grads_for_sync.append(original_param.grad)
 
             # --- Batch Communication ---
             comm_start_sync = time.time()
-            if grads_for_sync:  # Proceed only if there are gradients to sync
-                # Flatten all gradients into a single tensor for efficient all-reduce
-                flat_grads = torch.cat([g.flatten() for g in grads_for_sync])
-                # Aggregate gradients across all workers
+            if grads_for_sync:
+                device = next(model.parameters()).device
+                flat_grads = _flatten_dense_tensors(
+                    [grad.detach() for grad in grads_for_sync]
+                ).to(device, non_blocking=True)
                 dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
-                # Average the gradients
                 flat_grads.div_(world_size)
-
-                # --- Unflatten Gradients ---
-                # Copy the averaged gradients back to the original_model's .grad attributes
-                offset = 0
-                for grad_sync in grads_for_sync:
-                    numel = grad_sync.numel()
-                    grad_sync.copy_(
-                        flat_grads[offset : offset + numel].view_as(grad_sync)
-                    )
-                    offset += numel
+                if offload_cpu:
+                    flat_grads = flat_grads.to("cpu", non_blocking=True)
+                averaged_grads = _unflatten_dense_tensors(
+                    flat_grads, grads_for_sync
+                )
+                for grad, averaged in zip(grads_for_sync, averaged_grads):
+                    grad.copy_(averaged)
+                del flat_grads, averaged_grads
             sync_comm_time = time.time() - comm_start_sync
 
             # --- Outer Optimizer Step ---
             outer_optimizer.step()
-            outer_optimizer.zero_grad(
-                set_to_none=True
-            )  # Use set_to_none=True for potential memory savings
+            outer_optimizer.zero_grad(set_to_none=True)
 
             # --- Update Worker Model ---
             # Copy the globally updated parameters from original_model back to the worker model
             for param, original_param in zip(
                 model.parameters(), original_model.parameters()
             ):
-                # Preserve original semantics: copy updated snapshot params back to the worker model
-                param.data.copy_(original_param.data)
-
+                param.data.copy_(original_param.data.to(param.device))
         else:
             # --- Direct Averaging Synchronization (No Outer Optimizer) ---
             comm_start_sync = time.time()
